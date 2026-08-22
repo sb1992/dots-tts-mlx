@@ -241,7 +241,47 @@ sentence. `--speed` and `--profile` both work with `--long`.
 > with a fresh seed (default up to 2 retries). Disable with `--no-retry-degenerate`, tune
 > with `--max-retries N`. Healthy chunks are unchanged (retries only fire on failure). The
 > cheap guard catches truncation; callers with ASR can pass `generate_long(validator=…)` to
-> also catch same-length hallucinations (the CLI stays dependency-free).
+> also catch same-length hallucinations (the CLI stays dependency-free) — see
+> [ASR-validated chunks](#asr-validated-chunks-example).
+
+### ASR-validated chunks (example)
+
+`chunk_health` cannot tell a correct chunk from one that is the right length but says the
+wrong words — that needs a transcript, i.e. an ASR dependency the package deliberately
+does not take. Instead, `generate_long(validator=…)` takes a
+`(audio, chunk_text, sample_rate) -> bool` callback; returning `False` reseeds and
+regenerates that chunk (up to `max_retries`).
+
+[`examples/asr_validated_long.py`](examples/asr_validated_long.py) is a ready-to-run
+implementation: transcribe each chunk with [mlx-whisper](https://pypi.org/project/mlx-whisper/),
+accept it when its word error rate against the intended text is `<= --max-wer`.
+
+```bash
+pip install mlx-whisper   # not a dependency of dots-tts-mlx
+
+python examples/asr_validated_long.py \
+    --model weights/dots_tts_mlx \
+    --text "First sentence. Second sentence. Third one here." \
+    --ref-audio reference.wav --ref-text "transcript of reference.wav" \
+    --language EN --max-wer 0.5
+```
+
+It uses WER rather than word *coverage* on purpose: coverage is recall-only, so a clip
+that says everything it should **plus** a sentence of invented text still scores perfectly.
+WER counts insertions and substitutions, which is the failure the hook exists to catch.
+For the same reason `--max-wer` is deliberately **not** capped at 1.0 — insertions divide
+by the *reference* length, so WER is unbounded above and a threshold above 1 is a real
+(lax) setting. Negative values are rejected: they can never be met, so every chunk would
+burn its whole retry budget.
+
+> **The example is scoped to whitespace-delimited languages.** Its tokenizer is `\w+`,
+> which is unicode-aware but still effectively whitespace-delimited: in a script written
+> without spaces (Chinese, Japanese, Thai, Lao, Khmer, Burmese) a whole clause becomes one
+> token, so WER can only come out 0.0 or 1.0 and the gate carries no information. The
+> script detects those up front and exits with an explanation rather than reporting a
+> meaningless number. dots.tts renders those languages fine — it is this *example's metric*
+> that does not apply; gating them needs a language-aware segmenter (jieba / MeCab /
+> PyThaiNLP) in place of `normalize_words`.
 
 ## Python API
 
