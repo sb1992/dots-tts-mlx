@@ -139,6 +139,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=2,
         help="(--long) max reseed-retries per degenerate chunk (default 2; 0 = off).",
     )
+    ap.add_argument(
+        "--no-reuse-reference",
+        dest="reuse_reference",
+        action="store_false",
+        help="(--long, with --ref-audio) re-encode the reference for EVERY chunk instead "
+        "of enrolling it once up front. Default is to enroll once; the flag restores the "
+        "old per-chunk encode for A/B / debugging.",
+    )
     return ap
 
 
@@ -201,7 +209,8 @@ def main() -> int:
         _gen = model.generate_long if args.long else model.generate
         _kw = (
             {"gap_ms": args.gap_ms, "max_chars": args.max_chars,
-             "retry_degenerate": args.retry_degenerate, "max_retries": args.max_retries}
+             "retry_degenerate": args.retry_degenerate, "max_retries": args.max_retries,
+             "reuse_reference": args.reuse_reference}
             if args.long else {}
         )
         out = _gen(

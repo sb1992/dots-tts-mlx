@@ -780,6 +780,7 @@ class DotsTtsModel:
         retry_degenerate: bool = True,
         max_retries: int = 2,
         validator: "Callable[[np.ndarray, str, int], bool] | None" = None,  # noqa: F821
+        reuse_reference: bool = True,
     ) -> dict:
         """Render long/multilingual text by sentence-chunking.
 
@@ -791,9 +792,22 @@ class DotsTtsModel:
 
         Conditioning/sampling args mirror ``generate``; ``profile`` is mutually exclusive
         with ``prompt_audio``/``prompt_text`` (enforced inside ``generate``). ``streaming_decode``
-        (default on) is forwarded to each per-chunk ``generate`` call. Returns
-        ``{"audio": [1, T], "sample_rate", "num_chunks", "num_patches"}``. (Speed is a CLI
+        (default on) is forwarded to each per-chunk ``generate`` call. (Speed is a CLI
         post-process, matching ``generate``.)
+
+        Returns ``{"audio": [1, T], "sample_rate", "num_chunks", "num_patches", "retries",
+        "unrecovered", "reused_reference"}``, where ``retries`` counts regeneration attempts
+        across all chunks, ``unrecovered`` counts chunks still rejected at the retry cap, and
+        ``reused_reference`` reports whether the up-front enrollment below actually happened
+        (see ``reuse_reference``) -- it is ``False`` for a caller-supplied ``profile``, for
+        plain TTS, when opted out, and when enrollment was attempted but failed.
+
+        ``reuse_reference`` (default on) enrolls a raw ``prompt_audio``/``prompt_text``
+        reference ONCE up front and clones every chunk from the resulting profile, so the
+        reference encode is not repeated per sentence -- see the note at the enrollment
+        block below. It is a no-op when a ``profile`` is already supplied or when there is
+        no reference (plain TTS). ``reuse_reference=False`` restores the per-chunk
+        reference encode (A/B + debugging).
 
         ``num_steps=None`` (default) resolves per-mode in ``generate`` (4 meanflow / 10
         flow-matching).
@@ -809,6 +823,51 @@ class DotsTtsModel:
         chunks = split_for_generation(text, max_chars=cap, language=language)
         if not chunks:
             raise ValueError("generate_long: text is empty after splitting.")
+
+        # --- reference reuse: enroll ONCE, then clone every chunk from the cache. ---
+        # Each chunk is an independent generate() call, so a raw (prompt_audio,
+        # prompt_text) reference is re-encoded PER SENTENCE -- the CAM++ speaker
+        # embedding + the AudioVAE encode + the patch-encoder pass, which is also the
+        # memory high-water of a render. Enrolling once and passing that profile to
+        # every chunk pays the encode a single time (this is exactly the manual
+        # "--enroll then --profile" workflow, done for the caller).
+        #
+        # Attempt-0 output is preserved under the CURRENT prompt-conditioning contract,
+        # which is a one-draw contract: generate()'s reference path consumes exactly ONE
+        # mx.random.normal draw for the prompt sample (io.sample_from_latent) and the
+        # profile path replicates that draw, so seeding the same RNG state here caches the
+        # same prompt sample the per-chunk path would have drawn. That is a property of
+        # today's conditioning code, NOT durable byte identity -- anything that changes how
+        # many draws the reference path makes (or their order) breaks the correspondence,
+        # and the equality is only ever asserted to the tolerance of the profile-parity
+        # gate (test_generate_long_reuse.py::test_reuse_reference_matches_the_per_chunk_path,
+        # itself inherited from test_enroll.py::test_profile_generate_matches_one_shot).
+        #
+        # Retries are a DELIBERATE semantics change: they still reseed the decode noise,
+        # but they now reuse the one enrolled prompt sample instead of drawing a fresh one
+        # per attempt, so a retried chunk explores decode noise only -- not a different
+        # reference encoding. Pass reuse_reference=False for the old per-attempt resample.
+        reused_reference = False
+        if reuse_reference and profile is None and prompt_audio is not None and prompt_text:
+            try:
+                # Seed BOTH generators, matching generate()'s preamble, so the enrollment
+                # starts from the same RNG state a per-chunk reference encode would have.
+                mx.random.seed(int(seed))
+                np.random.seed(int(seed))
+                profile = self.enroll(prompt_audio, prompt_text, speaker_scale=speaker_scale)
+            except ValueError:
+                # enroll() raises ValueError for a model built without a compat hash (i.e.
+                # not via from_pretrained). Reuse is a pure optimization, so fall back to
+                # the per-chunk reference path rather than failing a render that would
+                # otherwise succeed. Anything else (an AttributeError included) is a real
+                # bug and is left to propagate.
+                profile = None
+            else:
+                prompt_audio = prompt_text = None  # now mutually exclusive with profile
+                reused_reference = True
+                mx.synchronize()
+                mx.clear_cache()
+                gc.collect()
 
         max_retries = max(0, int(max_retries))
         pieces: list[np.ndarray] = []
@@ -876,6 +935,7 @@ class DotsTtsModel:
             "num_patches": total_patches,
             "retries": total_retries,
             "unrecovered": unrecovered,
+            "reused_reference": reused_reference,
         }
 
     # endregion generate
