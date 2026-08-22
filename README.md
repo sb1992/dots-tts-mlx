@@ -201,8 +201,8 @@ cloned voice. The transcript is **never** part of the output; only your `--text`
 **Keep the reference short (a few seconds).** A longer reference does **not** improve adherence,
 and it costs noticeably more time and memory — the model re-attends the whole reference on every
 step (and on every sentence under `--long`). A short, accurate transcript gives the closest match
-at the lowest cost. For long cloned passages, [enroll the voice once](#enroll-once-reuse-a-voice)
-so the reference encode isn't recomputed per sentence.
+at the lowest cost. The reference *encode* is already shared across `--long` chunks; to skip it
+across separate runs too, [enroll the voice once](#enroll-once-reuse-a-voice).
 
 ## Long / multilingual text (`--long`)
 
@@ -231,10 +231,26 @@ per-chunk cap). Because every chunk stays short:
   are modestly quicker than one long pass. (It is *not* a per-clip speed-up — for that, use the
   [MeanFlow decoder](#meanflow-few-step-decoder-the-mf-checkpoint).)
 
-**Reference cost under `--long`.** Each chunk re-applies the reference, and that prefix is
-re-attended for *every* sentence — so for long text keep the reference **short**, and/or
-[enroll the voice once](#enroll-once-reuse-a-voice) so the reference encode isn't recomputed per
-sentence. `--speed` and `--profile` both work with `--long`.
+**Reference cost under `--long`.** The reference **encode** is paid once per render, not once
+per sentence: when you pass `--ref-audio`/`--ref-text` with `--long`, the reference is
+[enrolled](#enroll-once-reuse-a-voice) up front and every chunk clones from that cached
+profile. This is the manual "enroll, then `--profile`" workflow done for you.
+(`--no-reuse-reference` restores the old per-chunk encode for A/B.) Passing `--profile`
+directly is equivalent and skips the enrollment too.
+
+Two caveats worth knowing:
+
+- **First-attempt output is preserved under the current one-draw prompt-conditioning
+  contract** — the reference path consumes exactly one random draw for the prompt sample
+  and the profile path replicates it, so the same seed yields the same attempt-0 audio (to
+  the tolerance of the profile-parity gate in `tests/`). That is a property of today's
+  conditioning code, not a promise of byte identity across future versions.
+- **Retries now reuse the enrolled prompt sample** instead of resampling the reference per
+  attempt — a deliberate change from the old path. A regenerated chunk explores decode
+  noise only; `--no-reuse-reference` restores the per-attempt resample.
+
+Each chunk still *re-attends* the reference prefix during its own prefill, so keeping the
+reference **short** still pays off on long text. `--speed` and `--profile` both work with `--long`.
 
 > **Self-healing chunks (v0.5.1).** Under `--long`, each sentence chunk is health-checked
 > (finite, non-silent, not absurdly short for its text); a degenerate chunk is regenerated
@@ -306,9 +322,10 @@ out = model.generate("Hello from the enrolled voice.", profile=profile, language
 - **Portable across precisions:** a profile enrolled on int4 also loads on int8 / bf16
   (the cached conditioning comes from bf16-only components). Loading against a different
   model raises a clear error.
-- **Pairs with `--long`:** chunked long-form generation otherwise re-encodes the reference
-  **once per sentence**. A profile does that work **once**, so enrolling and passing `--profile`
-  is the efficient way to clone a voice across a long passage.
+- **Pairs with `--long`:** chunked long-form generation needs the reference encode **once**,
+  not once per sentence — `--long` now enrolls automatically when handed `--ref-audio`, so this
+  is the default. Saving a profile still pays off across *separate* runs: `--profile` skips the
+  enrollment (and its ~10 GB peak) entirely.
 - `--enroll` requires `--ref-text`; `--profile` is mutually exclusive with `--ref-audio`/`--ref-text`.
 
 > **Why this exists / not in upstream.** Upstream `dots.tts` has no enroll/profile concept — it
@@ -320,9 +337,11 @@ out = model.generate("Hello from the enrolled voice.", profile=profile, language
 
 ## Roadmap
 
-- **Cheaper cloned chunking.** Reusing one enrolled reference across `--long` chunks (so the
-  in-context prefix isn't re-attended per sentence) is a planned optimization; today, keep the
-  reference short or [enroll the voice once](#enroll-once-reuse-a-voice) for long cloned passages.
+- **Cheaper cloned chunking.** The reference *encode* is now shared across `--long` chunks
+  (enrolled once per render — see [Reference cost under `--long`](#long--multilingual-text---long)).
+  Not yet shared: the in-context **prefix attention**, which each chunk still repeats in its own
+  prefill. Hoisting that across chunks is the remaining optimization; until then, keep the
+  reference short for long cloned passages.
 
 ## How it was ported / parity
 
