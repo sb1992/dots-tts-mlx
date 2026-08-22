@@ -170,6 +170,58 @@ dots-tts --model weights/dots_tts_mlx_mf_int4 --text "..." --ref-audio ref.wav -
 
 MeanFlow mode is **auto-detected** from `config.json` (the `meanflow` block) — no flag. `--num-steps` then defaults to 4 (the NFE) and `--guidance-scale` is ignored (CFG is fused into the distilled student).
 
+### Converting your own fine-tuned checkpoint
+
+`convert` doesn't care where a checkpoint came from — it takes **any HF-format dots.tts
+directory**, upstream or your own fine-tune, and emits the same MLX artifacts. Training
+itself is out of scope here (this repo is inference only); this is just how to bring the
+result across.
+
+```bash
+python -m dots_tts_mlx.convert  --src /path/to/your-finetuned-dots-tts --out weights/my_ft_mlx
+python -m dots_tts_mlx.quantize --src weights/my_ft_mlx --out weights/my_ft_mlx_int4 --bits 4
+dots-tts --model weights/my_ft_mlx_int4 --text "..." \
+    --ref-audio ref.wav --ref-text "transcript of ref.wav" --language EN
+```
+
+**`convert` requires all of these** — it fails fast if any is missing:
+
+| File | Notes |
+|---|---|
+| `model.safetensors` | LLM trunk + DiT + patch encoder + projections |
+| `vocoder.safetensors` | AudioVAE + BigVGAN decoder (its `weight_norm` is folded during conversion) |
+| `speaker_encoder.safetensors` | CAM++ speaker encoder |
+| `latent_stats.pt` | AudioVAE latent mean/var → written out as `latent_stats.npz` |
+| `config.json`, `llm_config.json` | copied verbatim into the output |
+
+**The tokenizer is required at *runtime*, but `convert` does not check for it.** It copies
+`tokenizer.json`, `vocab.json`, `merges.txt`, `tokenizer_config.json`,
+`special_tokens_map.json`, `added_tokens.json` and `chat_template.jinja` into
+`<out>/tokenizer/` **only if present**, and always creates that directory — so a source
+directory with no tokenizer converts *successfully* and only fails later, when the model is
+loaded, with `missing tokenizer.json: <out>/tokenizer/tokenizer.json`. `tokenizer.json` is
+the one that actually matters (the runtime reads the saved fast tokenizer directly); the
+others are copied for completeness. If your fine-tune didn't re-emit them, copy them across
+from the base checkpoint before converting, or drop them into `<out>/tokenizer/` afterwards.
+
+**Most fine-tunes only re-emit `model.safetensors`.** The vocoder, speaker encoder,
+`latent_stats.pt`, both config JSONs and the tokenizer are usually untouched by training,
+so copy them across from the base checkpoint you fine-tuned *from* — they must be the ones
+that model was trained against. In particular, `latent_stats` has to match the AudioVAE that produced
+the latents; pairing a fine-tune with the wrong stats denormalizes every patch incorrectly
+and the output will be noise, not a subtly worse voice.
+
+Everything downstream is unchanged: the decoder is auto-detected (so a fine-tune of the
+`mf` checkpoint stays MeanFlow), `--bits {16,8,4}` quantizes the LLM trunk exactly as for
+the stock weights, and the parity tests in `tests/` are written against upstream fixtures —
+they gate *the port*, not your checkpoint.
+
+> **Re-enroll your profiles after fine-tuning.** The `.dtprofile` compatibility hash pins
+> the *architecture* (config dims, latent stats, and the non-LLM tensor names/shapes) — it
+> does not hash weight values. So a fine-tune that keeps the same shapes produces the same
+> hash, and an old profile will load **without complaint** while carrying conditioning
+> computed from the old weights. Re-run `--enroll` against the converted fine-tune.
+
 ## CLI usage
 
 ```bash
